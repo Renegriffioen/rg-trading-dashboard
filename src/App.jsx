@@ -3,44 +3,59 @@ import { supabase } from './lib/supabase'
 
 const fmtEUR = new Intl.NumberFormat('nl-NL', { style: 'currency', currency: 'EUR' })
 
-function useRealtimeSafe(table, select='*', order='ts', desc=true, limit=50){
+function useRealtimeTable({ table, select='*', order='ts', desc=true, limit=50, agent='crypto' }){
   const [rows, setRows] = useState([])
   const [error, setError] = useState(null)
+
   useEffect(()=>{
     let mounted = true
     const load = async()=>{
       try{
         let q = supabase.from(table).select(select).order(order, {ascending:!desc})
+        if(agent && agent !== 'ALL') q = q.eq('agent', agent)
         if(limit) q = q.limit(limit)
         const { data, error } = await q
         if(error) throw error
         if(mounted) setRows(data||[])
-      }catch(e){
-        if(mounted) setError(e.message)
-      }
+      }catch(e){ if(mounted) setError(e.message) }
     }
     load()
+
     const sub = supabase.channel(`${table}-changes`).on(
-      'postgres_changes', { event: 'INSERT', schema: 'public', table }, (payload)=>{
-        setRows(prev=>[payload.new, ...prev].slice(0, limit))
+      'postgres_changes', { event: 'INSERT', schema: 'public', table },
+      (payload)=>{
+        const rec = payload.new
+        if(agent && agent !== 'ALL' && rec.agent !== agent) return
+        setRows(prev => [rec, ...prev].slice(0, limit))
       }
     ).subscribe()
+
     return ()=>{ mounted=false; supabase.removeChannel(sub) }
-  }, [table, select, order, desc, limit])
+  }, [table, select, order, desc, limit, agent])
+
   return { rows, error }
 }
 
 export default function App(){
-  const { rows: trades, error: tradesErr } = useRealtimeSafe('trades','id,ts,symbol,side,qty,price,price_eur,quote_ccy','ts',true,50)
-  const { rows: equity, error: eqErr } = useRealtimeSafe('equity_snapshots','ts,equity,day_pnl','ts',true,1)
-  const { rows: signals, error: sigErr } = useRealtimeSafe('signals','id,ts,symbol,side,confidence,reason','ts',true,20)
+  // Agent filter (default: crypto)
+  const [agent, setAgent] = useState('crypto') // 'ALL' | 'crypto' | 'stocks'
+
+  const { rows: trades,  error: tradesErr } = useRealtimeTable({
+    table: 'trades', select: 'id,ts,symbol,side,qty,price,price_eur,quote_ccy,agent', agent, limit: 50
+  })
+  const { rows: signals, error: sigErr } = useRealtimeTable({
+    table: 'signals', select: 'id,ts,symbol,side,confidence,reason,agent', agent, limit: 20
+  })
+  const { rows: equity,  error: eqErr } = useRealtimeTable({
+    table: 'equity_snapshots', select: 'ts,equity,day_pnl,agent', agent, limit: 1
+  })
 
   const lastEq = equity[0]
 
   // ---- Instellingen (settings singleton id=1) ----
   const [settings, setSettings] = useState(null)
   const [fallback, setFallback] = useState('0.92')
-  const [fxSource, setFxSource] = useState('auto')   // 'auto' | 'manual'
+  const [fxSource, setFxSource] = useState('auto')
   const [wlText, setWlText] = useState('BTCEUR,ETHEUR')
   const [saving, setSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState(null)
@@ -48,13 +63,11 @@ export default function App(){
   useEffect(()=>{
     let mounted = true
     const load = async ()=>{
-      const { data, error } = await supabase
-        .from('settings')
+      const { data } = await supabase.from('settings')
         .select('fallback_usdt_eur, fx_source, whitelist')
-        .eq('id', 1)
-        .single()
+        .eq('id', 1).single()
       if(!mounted) return
-      if(!error && data){
+      if(data){
         setSettings(data)
         setFallback(String(data.fallback_usdt_eur ?? '0.92'))
         setFxSource(data.fx_source ?? 'auto')
@@ -63,8 +76,7 @@ export default function App(){
     }
     load()
     const sub = supabase.channel('settings-live').on(
-      'postgres_changes',
-      { event: 'UPDATE', schema: 'public', table: 'settings' },
+      'postgres_changes', { event: 'UPDATE', schema: 'public', table: 'settings' },
       (payload)=>{
         const d = payload.new
         setSettings(d)
@@ -79,19 +91,13 @@ export default function App(){
   const onSave = async ()=>{
     setSaveMsg(null)
     let val = parseFloat(fallback)
-    if(Number.isNaN(val)) { setSaveMsg('Voer een getal in voor fallback USDT→EUR.'); return }
-    if(val <= 0.5 || val >= 1.5){ setSaveMsg('Waarde buiten redelijke band (0.5–1.5).'); return }
+    if(Number.isNaN(val)) { setSaveMsg('Voer een getal in.'); return }
+    if(val <= 0.5 || val >= 1.5){ setSaveMsg('Waarde buiten 0.5–1.5.'); return }
     const wl = wlText.split(',').map(s=>s.trim()).filter(Boolean)
     setSaving(true)
-    const { error } = await supabase
-      .from('settings')
-      .update({
-        fallback_usdt_eur: val,
-        fx_source: fxSource,
-        whitelist: wl,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', 1)
+    const { error } = await supabase.from('settings').update({
+      fallback_usdt_eur: val, fx_source: fxSource, whitelist: wl, updated_at: new Date().toISOString()
+    }).eq('id', 1)
     setSaving(false)
     setSaveMsg(error ? `Opslaan mislukt: ${error.message}` : 'Opgeslagen ✔')
   }
@@ -99,6 +105,25 @@ export default function App(){
   return (
     <div className="wrap">
       <h1 style={{margin:'10px 0'}}>📈 Handelsdashboard</h1>
+
+      {/* Agent filter */}
+      <div className="kpi" style={{marginBottom:12}}>
+        <div style={{display:'flex', gap:8, alignItems:'center', flexWrap:'wrap'}}>
+          <strong>Weergave:</strong>
+          {['ALL','crypto','stocks'].map(a=>(
+            <button key={a}
+              onClick={()=>setAgent(a)}
+              style={{
+                padding:'6px 10px', borderRadius:10, border:'1px solid #263159',
+                background: agent===a ? '#1e2752' : '#121a36', color:'#fff', cursor:'pointer'
+              }}
+            >
+              {a === 'ALL' ? 'Alles' : a}
+            </button>
+          ))}
+          <span className="muted">— filtert live de kolommen hieronder</span>
+        </div>
+      </div>
 
       <div className="muted" style={{marginBottom:8}}>
         {(!import.meta.env.VITE_SUPABASE_URL || !import.meta.env.VITE_SUPABASE_ANON_KEY) && (
@@ -112,7 +137,7 @@ export default function App(){
       {/* KPI + Signalen */}
       <div className="grid" style={{gridTemplateColumns:'1fr 1fr', gap:12}}>
         <div className="kpi">
-          <div>Vermogen (EUR)</div>
+          <div>Vermogen (EUR) {agent!=='ALL' ? `– ${agent}` : ''}</div>
           <div style={{fontSize:28,fontWeight:700}}>{lastEq? fmtEUR.format(lastEq.equity): '—'}</div>
           <div className="muted">Dag-PnL: {lastEq? fmtEUR.format(lastEq.day_pnl): '—'}</div>
         </div>
@@ -126,7 +151,7 @@ export default function App(){
                 <span style={{fontWeight:600}}>{s.symbol}</span>
                 <span style={{opacity:.8}}>vertr. {s.confidence?.toFixed(2)}</span>
                 <span style={{opacity:.6}}>{new Date(s.ts).toLocaleTimeString('nl-NL')}</span>
-                <span style={{opacity:.6}}>• {s.reason}</span>
+                <span style={{opacity:.6}}>• {s.agent}</span>
               </div>
             ))}
             {signals.length===0 && <div className="muted">(nog geen signalen)</div>}
@@ -134,36 +159,36 @@ export default function App(){
         </div>
       </div>
 
-      {/* Instellingen paneel */}
+      {/* Instellingen */}
       <div className="kpi" style={{marginTop:12}}>
         <h2 style={{margin:'0 0 8px'}}>⚙️ Instellingen</h2>
         {!settings && <div className="muted">Instellingen laden…</div>}
 
         <div style={{display:'grid', gap:10}}>
           <label style={{display:'grid', gap:6}}>
-            <span className="muted">Bron wisselkoers (USDT→EUR)</span>
+            <span className="muted">Bron wisselkoers (USDT/USD → EUR)</span>
             <select value={fxSource} onChange={e=>setFxSource(e.target.value)} style={{padding:'8px', borderRadius:8, border:'1px solid #263159', background:'#0b1020', color:'#fff'}}>
-              <option value="auto">auto (probeer live EUR/USDT via exchange)</option>
-              <option value="manual">handmatig (gebruik de fallback hieronder)</option>
+              <option value="auto">auto (probeer live koers; voor stocks gebruikt EURUSD)</option>
+              <option value="manual">handmatig (gebruik fallback hieronder)</option>
             </select>
           </label>
 
           <label style={{display:'grid', gap:6}}>
-            <span className="muted">Fallback USDT→EUR (bijv. 0.92)</span>
+            <span className="muted">Fallback USDT/USD → EUR (bijv. 0.92)</span>
             <input value={fallback} onChange={e=>setFallback(e.target.value)} placeholder="0.92"
               style={{padding:'8px', borderRadius:8, border:'1px solid #263159', background:'#0b1020', color:'#fff'}} />
           </label>
 
           <label style={{display:'grid', gap:6}}>
-            <span className="muted">Whitelist (komma-gescheiden)</span>
+            <span className="muted">Whitelist (crypto-agent gebruikt deze lijst)</span>
             <input value={wlText} onChange={e=>setWlText(e.target.value)} placeholder="BTCEUR,ETHEUR"
               style={{padding:'8px', borderRadius:8, border:'1px solid #263159', background:'#0b1020', color:'#fff'}} />
           </label>
 
           <div style={{display:'flex', gap:8, alignItems:'center'}}>
-            <button onClick={onSave} disabled={saving}
+            <button onClick={onSave}
               style={{padding:'8px 12px', borderRadius:10, border:'1px solid #263159', background:'#121a36', color:'#fff', cursor:'pointer'}}>
-              {saving ? 'Opslaan…' : 'Opslaan'}
+              Opslaan
             </button>
             {saveMsg && <span className="muted">{saveMsg}</span>}
           </div>
@@ -180,7 +205,7 @@ export default function App(){
           <table className="tbl">
             <thead>
               <tr>
-                <th>Tijd</th><th>Symbool</th><th>Richting</th><th>Aantal</th><th>Prijs (EUR)</th>
+                <th>Tijd</th><th>Symbool</th><th>Richting</th><th>Aantal</th><th>Prijs (EUR)</th><th>Agent</th>
               </tr>
             </thead>
             <tbody>
@@ -196,11 +221,12 @@ export default function App(){
                     <td><span className={`pill ${t.side==='buy'?'buy':'sell'}`}>{t.side}</span></td>
                     <td>{t.qty}</td>
                     <td>{shown}</td>
+                    <td>{t.agent}</td>
                   </tr>
                 )
               })}
               {trades.length===0 && (
-                <tr><td colSpan="5" className="muted">(nog geen transacties)</td></tr>
+                <tr><td colSpan="6" className="muted">(nog geen transacties)</td></tr>
               )}
             </tbody>
           </table>
